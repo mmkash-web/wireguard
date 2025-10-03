@@ -4,26 +4,34 @@ A complete WireGuard VPN solution for managing multiple MikroTik routers with a 
 
 ## 🚀 Quick Start
 
-### 1. VPS Installation
+### Option 1: One-Command Installation (Recommended)
 ```bash
-# Upload this project to your VPS
-# Then run the installation script
+# Install everything directly from GitHub
+curl -sSL https://raw.githubusercontent.com/mmkash-web/wireguard/main/install.sh | bash
+```
+
+### Option 2: Manual Installation
+```bash
+# 1. Clone the repository
+git clone https://github.com/mmkash-web/wireguard.git
+cd wireguard
+
+# 2. Run VPS installation
 sudo bash scripts/install-wireguard-vps.sh
-```
 
-### 2. Generate Router Configurations
-```bash
-# Generate configs for your routers
+# 3. Generate router configs
 ./scripts/mikrotik-wireguard-setup.sh -v YOUR_VPS_IP -k YOUR_VPS_PUBLIC_KEY -c 10
+
+# 4. Launch management interface
+sudo python3 menu/wireguard-menu.py
 ```
 
-### 3. Launch Management Interface
+### Option 3: Automated Deployment
 ```bash
-# Start the management menu
-sudo python3 menu/wireguard-menu.py
-
-# Or start the real-time dashboard
-sudo python3 menu/wireguard-dashboard.py
+# Deploy to VPS with one command
+wget https://raw.githubusercontent.com/mmkash-web/wireguard/main/deploy.sh
+chmod +x deploy.sh
+./deploy.sh -v YOUR_VPS_IP -u root
 ```
 
 ## 📁 Project Structure
