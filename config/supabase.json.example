@@ -1,0 +1,5 @@
+{
+  "url": "https://your-project.supabase.co",
+  "key": "your-supabase-anon-key",
+  "table": "routers"
+}

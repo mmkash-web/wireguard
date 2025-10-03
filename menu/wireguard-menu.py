@@ -10,13 +10,15 @@ import json
 import time
 import subprocess
 import socket
+import re
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime
 import argparse
 
-# Add project path for Django integration
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Add project path for database integration
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Try to import Django components
 try:
     from routers.models import Router
     from routers.services.mikrotik_api import MikroTikAPIService
@@ -24,6 +26,20 @@ try:
     DJANGO_AVAILABLE = True
 except ImportError:
     DJANGO_AVAILABLE = False
+
+# Try to import Supabase
+try:
+    from supabase import create_client, Client
+    SUPABASE_AVAILABLE = True
+except ImportError:
+    SUPABASE_AVAILABLE = False
+
+# Import database manager
+try:
+    from database_manager import DatabaseManager
+    DATABASE_AVAILABLE = True
+except ImportError:
+    DATABASE_AVAILABLE = False
 
 # Colors and formatting
 class Colors:
@@ -37,11 +53,187 @@ class Colors:
     BOLD = '\033[1m'
     NC = '\033[0m'  # No Color
 
+class WireGuardConfigManager:
+    """Manages WireGuard configuration without Django"""
+    
+    def __init__(self):
+        self.config_file = "/etc/wireguard/wg0.conf"
+        self.interface = "wg0"
+    
+    def get_peers_from_config(self) -> List[Dict]:
+        """Get peers from WireGuard configuration file"""
+        peers = []
+        try:
+            with open(self.config_file, 'r') as f:
+                content = f.read()
+                
+            # Parse peers from config file
+            peer_blocks = re.findall(r'# (.+?)\n\[Peer\]\nPublicKey = (.+?)\nAllowedIPs = (.+?)(?=\n\n|\n#|\Z)', content, re.DOTALL)
+            
+            for name, public_key, allowed_ips in peer_blocks:
+                peers.append({
+                    'name': name.strip(),
+                    'public_key': public_key.strip(),
+                    'allowed_ips': allowed_ips.strip(),
+                    'ip': allowed_ips.strip().split('/')[0]
+                })
+        except Exception as e:
+            print(f"Error reading config: {e}")
+        
+        return peers
+    
+    def get_peers_from_wg_command(self) -> List[Dict]:
+        """Get peers from wg command"""
+        peers = []
+        try:
+            result = subprocess.run(['wg', 'show', self.interface, 'peers'], 
+                                  capture_output=True, text=True)
+            if result.returncode == 0:
+                for line in result.stdout.strip().split('\n'):
+                    if line.strip():
+                        peers.append({
+                            'public_key': line.strip(),
+                            'name': f"Peer_{line.strip()[:8]}",
+                            'ip': 'Unknown',
+                            'allowed_ips': 'Unknown'
+                        })
+        except Exception as e:
+            print(f"Error running wg command: {e}")
+        
+        return peers
+    
+    def add_peer(self, name: str, public_key: str, ip: str = None) -> bool:
+        """Add a peer to WireGuard configuration"""
+        try:
+            if not ip:
+                # Get next available IP
+                peers = self.get_peers_from_config()
+                used_ips = [p['ip'] for p in peers if 'ip' in p]
+                for i in range(2, 255):
+                    candidate_ip = f"10.10.0.{i}"
+                    if candidate_ip not in used_ips:
+                        ip = candidate_ip
+                        break
+                
+                if not ip:
+                    print("No available IP addresses")
+                    return False
+            
+            # Add peer to config file
+            peer_config = f"\n# {name}\n[Peer]\nPublicKey = {public_key}\nAllowedIPs = {ip}/32\n"
+            
+            with open(self.config_file, 'a') as f:
+                f.write(peer_config)
+            
+            # Restart WireGuard
+            subprocess.run(['wg-quick', 'down', self.interface], capture_output=True)
+            subprocess.run(['wg-quick', 'up', self.interface], capture_output=True)
+            
+            return True
+        except Exception as e:
+            print(f"Error adding peer: {e}")
+            return False
+    
+    def remove_peer(self, name: str) -> bool:
+        """Remove a peer from WireGuard configuration"""
+        try:
+            with open(self.config_file, 'r') as f:
+                lines = f.readlines()
+            
+            # Find and remove peer block
+            new_lines = []
+            skip_until_next_section = False
+            
+            for i, line in enumerate(lines):
+                if line.strip() == f"# {name}":
+                    skip_until_next_section = True
+                    continue
+                elif skip_until_next_section and line.strip() == "[Peer]":
+                    continue
+                elif skip_until_next_section and line.startswith("PublicKey"):
+                    continue
+                elif skip_until_next_section and line.startswith("AllowedIPs"):
+                    skip_until_next_section = False
+                    continue
+                elif not skip_until_next_section:
+                    new_lines.append(line)
+            
+            # Write back to file
+            with open(self.config_file, 'w') as f:
+                f.writelines(new_lines)
+            
+            # Restart WireGuard
+            subprocess.run(['wg-quick', 'down', self.interface], capture_output=True)
+            subprocess.run(['wg-quick', 'up', self.interface], capture_output=True)
+            
+            return True
+        except Exception as e:
+            print(f"Error removing peer: {e}")
+            return False
+
+class SupabaseManager:
+    """Manages Supabase integration for router data"""
+    
+    def __init__(self):
+        self.client = None
+        self.available = False
+        self._init_supabase()
+    
+    def _init_supabase(self):
+        """Initialize Supabase connection"""
+        try:
+            # Try to get Supabase credentials from environment or config
+            supabase_url = os.getenv('SUPABASE_URL')
+            supabase_key = os.getenv('SUPABASE_KEY')
+            
+            if not supabase_url or not supabase_key:
+                # Try to read from config file
+                config_file = os.path.join(os.path.dirname(__file__), '..', 'config', 'supabase.json')
+                if os.path.exists(config_file):
+                    with open(config_file, 'r') as f:
+                        config = json.load(f)
+                        supabase_url = config.get('url')
+                        supabase_key = config.get('key')
+            
+            if supabase_url and supabase_key:
+                self.client = create_client(supabase_url, supabase_key)
+                self.available = True
+        except Exception as e:
+            print(f"Supabase initialization failed: {e}")
+            self.available = False
+    
+    def get_routers(self) -> List[Dict]:
+        """Get routers from Supabase"""
+        if not self.available:
+            return []
+        
+        try:
+            response = self.client.table('routers').select('*').eq('vpn_type', 'wireguard').execute()
+            return response.data
+        except Exception as e:
+            print(f"Error fetching routers from Supabase: {e}")
+            return []
+    
+    def add_router(self, router_data: Dict) -> bool:
+        """Add router to Supabase"""
+        if not self.available:
+            return False
+        
+        try:
+            response = self.client.table('routers').insert(router_data).execute()
+            return True
+        except Exception as e:
+            print(f"Error adding router to Supabase: {e}")
+            return False
+
 class WireGuardMenu:
     """Main menu system for WireGuard MikroTik management"""
     
     def __init__(self):
         self.wg_service = WireGuardMikroTikService() if DJANGO_AVAILABLE else None
+        self.wg_config = WireGuardConfigManager()
+        self.supabase = SupabaseManager()
+        self.database = DatabaseManager() if DATABASE_AVAILABLE else None
         self.running = True
         self.current_page = 1
         self.items_per_page = 10
@@ -223,48 +415,96 @@ class WireGuardMenu:
         print(f"{Colors.BOLD}{Colors.YELLOW}📋 ROUTER LIST{Colors.NC}")
         print(f"{Colors.CYAN}{'─'*80}{Colors.NC}")
         
-        if not DJANGO_AVAILABLE:
-            print(f"{Colors.RED}❌ Django not available. Cannot list routers from database.{Colors.NC}")
+        routers = []
+        
+        # Priority 1: Database (same as main Django system)
+        if self.database and self.database.available:
+            try:
+                db_routers = self.database.get_routers()
+                for router in db_routers:
+                    routers.append({
+                        'name': router.get('name', 'Unknown'),
+                        'public_key': router.get('public_key', 'Unknown'),
+                        'ip': router.get('ip_address', 'Unknown'),
+                        'status': 'Active' if router.get('is_active', False) else 'Inactive',
+                        'source': 'Database'
+                    })
+            except Exception as e:
+                print(f"{Colors.YELLOW}⚠️  Database error: {e}{Colors.NC}")
+        
+        # Priority 2: Django (if available)
+        if DJANGO_AVAILABLE:
+            try:
+                django_routers = Router.objects.filter(vpn_type="wireguard")
+                for router in django_routers:
+                    if not any(r['public_key'] == router.public_key for r in routers):
+                        routers.append({
+                            'name': router.name,
+                            'public_key': router.public_key,
+                            'ip': router.ip_address,
+                            'status': 'Active' if router.is_active else 'Inactive',
+                            'source': 'Django DB'
+                        })
+            except Exception as e:
+                print(f"{Colors.YELLOW}⚠️  Django database error: {e}{Colors.NC}")
+        
+        # Priority 3: Supabase (if available)
+        if self.supabase.available:
+            try:
+                supabase_routers = self.supabase.get_routers()
+                for router in supabase_routers:
+                    if not any(r['public_key'] == router.get('public_key') for r in routers):
+                        routers.append({
+                            'name': router.get('name', 'Unknown'),
+                            'public_key': router.get('public_key', 'Unknown'),
+                            'ip': router.get('ip_address', 'Unknown'),
+                            'status': 'Active' if router.get('is_active', False) else 'Inactive',
+                            'source': 'Supabase'
+                        })
+            except Exception as e:
+                print(f"{Colors.YELLOW}⚠️  Supabase error: {e}{Colors.NC}")
+        
+        # Priority 4: WireGuard Config (fallback)
+        try:
+            wg_routers = self.wg_config.get_peers_from_config()
+            for router in wg_routers:
+                # Check if already added from database
+                if not any(r['public_key'] == router['public_key'] for r in routers):
+                    routers.append({
+                        'name': router['name'],
+                        'public_key': router['public_key'],
+                        'ip': router['ip'],
+                        'status': 'Active',
+                        'source': 'WireGuard Config'
+                    })
+        except Exception as e:
+            print(f"{Colors.YELLOW}⚠️  WireGuard config error: {e}{Colors.NC}")
+        
+        if not routers:
+            print(f"{Colors.YELLOW}⚠️  No WireGuard routers found{Colors.NC}")
             self.wait_for_enter()
             return
         
-        try:
-            routers = Router.objects.filter(vpn_type="wireguard")
-            
-            if not routers.exists():
-                print(f"{Colors.YELLOW}⚠️  No WireGuard routers found in database{Colors.NC}")
-                self.wait_for_enter()
-                return
-            
-            print(f"{Colors.BOLD}Found {routers.count()} WireGuard routers:{Colors.NC}\n")
-            
-            # Table header
-            print(f"{'Name':<20} {'VPN IP':<15} {'Status':<10} {'API':<8} {'Last Check':<20}")
-            print(f"{Colors.CYAN}{'─'*80}{Colors.NC}")
-            
-            for router in routers:
-                # Check router status
-                status = self.wg_service.get_router_vpn_status(router) if self.wg_service else {"is_connected": False, "api_accessible": False}
-                
-                # Format status
-                if status["is_connected"]:
-                    status_text = f"{Colors.GREEN}Online{Colors.NC}"
-                else:
-                    status_text = f"{Colors.RED}Offline{Colors.NC}"
-                
-                # Format API status
-                if status.get("api_accessible", False):
-                    api_text = f"{Colors.GREEN}Yes{Colors.NC}"
-                else:
-                    api_text = f"{Colors.RED}No{Colors.NC}"
-                
-                # Format last check
-                last_check = router.last_vpn_check.strftime('%Y-%m-%d %H:%M') if router.last_vpn_check else "Never"
-                
-                print(f"{router.name:<20} {router.vpn_ip or 'N/A':<15} {status_text:<20} {api_text:<12} {last_check:<20}")
-            
-        except Exception as e:
-            print(f"{Colors.RED}❌ Error listing routers: {e}{Colors.NC}")
+        print(f"{Colors.BOLD}Found {len(routers)} WireGuard routers:{Colors.NC}\n")
+        
+        # Table header
+        print(f"{'Name':<20} {'VPN IP':<15} {'Status':<10} {'Source':<15} {'Public Key':<20}")
+        print(f"{Colors.CYAN}{'─'*80}{Colors.NC}")
+        
+        # Display routers
+        for router in routers:
+            status_color = Colors.GREEN if router['status'] == 'Active' else Colors.RED
+            print(f"{router['name']:<20} {router['ip']:<15} {status_color}{router['status']:<10}{Colors.NC} {router['source']:<15} {router['public_key'][:20]}...")
+        
+        print(f"\n{Colors.CYAN}{'─'*80}{Colors.NC}")
+        print(f"{Colors.BLUE}Data Sources:{Colors.NC}")
+        if self.database and self.database.available:
+            print(f"  {Colors.GREEN}✓{Colors.NC} Database (Primary)")
+        if DJANGO_AVAILABLE:
+            print(f"  {Colors.GREEN}✓{Colors.NC} Django Database")
+        if self.supabase.available:
+            print(f"  {Colors.GREEN}✓{Colors.NC} Supabase Database")
+        print(f"  {Colors.GREEN}✓{Colors.NC} WireGuard Configuration")
         
         self.wait_for_enter()
     
@@ -291,21 +531,48 @@ class WireGuardMenu:
                 return
             
             ip_address = input(f"{Colors.BOLD}VPN IP address (optional, auto-assign if empty): {Colors.NC}")
-            
-            # Add router using management script
-            cmd = ["wg-mikrotik", "add", router_name, public_key]
-            if ip_address:
-                cmd.append(ip_address)
+            if not ip_address.strip():
+                ip_address = None
             
             print(f"\n{Colors.BLUE}Adding router...{Colors.NC}")
-            result = subprocess.run(cmd, capture_output=True, text=True)
             
-            if result.returncode == 0:
-                print(f"{Colors.GREEN}✅ Router added successfully!{Colors.NC}")
-                print(f"Output: {result.stdout}")
+            # Add router using configuration manager
+            success = self.wg_config.add_peer(router_name, public_key, ip_address)
+            
+            if success:
+                print(f"{Colors.GREEN}✅ Router added to WireGuard configuration!{Colors.NC}")
+                
+                # Add to database (primary storage)
+                if self.database and self.database.available:
+                    router_data = {
+                        'name': router_name,
+                        'public_key': public_key,
+                        'ip_address': ip_address or 'Auto-assigned',
+                        'vpn_type': 'wireguard',
+                        'is_active': True,
+                        'api_accessible': False,
+                        'notes': 'Added via VPS menu'
+                    }
+                    if self.database.add_router(router_data):
+                        print(f"{Colors.GREEN}✅ Router added to database (primary storage){Colors.NC}")
+                    else:
+                        print(f"{Colors.YELLOW}⚠️  Router added to WireGuard but failed to add to database{Colors.NC}")
+                
+                # Also add to Supabase if available
+                elif self.supabase.available:
+                    router_data = {
+                        'name': router_name,
+                        'public_key': public_key,
+                        'ip_address': ip_address or 'Auto-assigned',
+                        'vpn_type': 'wireguard',
+                        'is_active': True
+                    }
+                    if self.supabase.add_router(router_data):
+                        print(f"{Colors.GREEN}✅ Router also added to Supabase database{Colors.NC}")
+                    else:
+                        print(f"{Colors.YELLOW}⚠️  Router added to WireGuard but failed to add to Supabase{Colors.NC}")
             else:
                 print(f"{Colors.RED}❌ Failed to add router{Colors.NC}")
-                print(f"Error: {result.stderr}")
         
         except Exception as e:
             print(f"{Colors.RED}❌ Error adding router: {e}{Colors.NC}")
